@@ -35,7 +35,10 @@
 
 /* Apple USB IDs */
 #define APPLE_VID_PATH_B     0x05AC
-#define RECOVERY_PID_PATH_B  0x1281
+/* Recovery mode PIDs: 0x1280-0x1283 cover all recovery mode variants.
+ * iBoot uses different PIDs depending on Tethered vs Semi-Tethered mode. */
+#define RECOVERY_PID_MIN     0x1280
+#define RECOVERY_PID_MAX     0x1283
 
 /* Forward declarations for module callbacks. */
 static int path_b_probe(device_info_t *dev);
@@ -132,16 +135,56 @@ static int step_reboot_to_recovery(device_info_t *dev)
             if (libusb_get_device_descriptor(devs[i], &desc) != LIBUSB_SUCCESS)
                 continue;
             if (desc.idVendor == APPLE_VID_PATH_B &&
-                desc.idProduct == RECOVERY_PID_PATH_B)
+                (desc.idProduct >= RECOVERY_PID_MIN &&
+                 desc.idProduct <= RECOVERY_PID_MAX))
                 found = 1;
         }
 
         libusb_free_device_list(devs, 1);
 
         if (found) {
-            log_info("[path_b] Recovery mode detected (%ds)", elapsed);
+            log_info("[path_b] Recovery mode device detected (%ds)", elapsed);
             libusb_exit(ctx);
-            return 0;
+
+            /* Verify recovery mode via libirecovery */
+            {
+                irecv_client_t iclient = NULL;
+                irecv_error_t  ierr;
+                int            imode = 0;
+                int            attempts = 0;
+
+                /* Give the device a moment to settle after re-enumeration */
+                usleep(1000000);  /* 1 second */
+
+                while (attempts < 5) {
+                    attempts++;
+                    if (dev->ecid != 0)
+                        ierr = irecv_open_with_ecid_and_attempts(&iclient,
+                                                                 (uint64_t)dev->ecid, 3);
+                    else
+                        ierr = irecv_open_with_ecid_and_attempts(&iclient, 0, 3);
+
+                    if (ierr == IRECV_E_SUCCESS && iclient) {
+                        ierr = irecv_get_mode(iclient, &imode);
+                        if (ierr == IRECV_E_SUCCESS &&
+                            imode >= IRECV_K_RECOVERY_MODE_1 &&
+                            imode <= IRECV_K_RECOVERY_MODE_4) {
+                            log_info("[path_b] Recovery mode confirmed via iRecovery (mode=0x%04X)",
+                                     (unsigned)imode);
+                            irecv_close(iclient);
+                            return 0;
+                        }
+                        log_debug("[path_b] Device not in recovery mode yet (mode=0x%04X), retrying...",
+                                  (unsigned)imode);
+                        irecv_close(iclient);
+                        iclient = NULL;
+                    }
+                    usleep(2000000);  /* 2 seconds between retries */
+                }
+
+                log_error("[path_b] Failed to verify recovery mode via iRecovery");
+                return -1;
+            }
         }
 
         log_debug("[path_b] Waiting for recovery... %ds / %ds",
@@ -237,10 +280,24 @@ static int step_reboot_to_normal(device_info_t *dev)
         return -1;
     }
 
-    /* Reconnect via lockdownd to populate dev->handle / dev->lockdown */
-    if (device_detect(dev) < 0) {
-        log_error("[path_b] device_detect failed after reboot");
-        return -1;
+    /* Reconnect via lockdownd to populate dev->handle / dev->lockdown.
+     * Preserve ECID across the reboot -- device_detect() memsets dev,
+     * and some devices don't return UniqueChipID via lockdownd. */
+    {
+        uint64_t saved_ecid = dev->ecid;
+        uint32_t saved_cpid = dev->cpid;
+        char     saved_udid[DEVICE_UDID_LEN];
+        snprintf(saved_udid, sizeof(saved_udid), "%s", dev->udid);
+
+        if (device_detect(dev) < 0) {
+            log_error("[path_b] device_detect failed after reboot");
+            return -1;
+        }
+        /* Restore fields that device_detect() zeroed but still need */
+        if (dev->ecid == 0) dev->ecid = saved_ecid;
+        if (dev->cpid == 0) dev->cpid = saved_cpid;
+        if (dev->udid[0] == '\0')
+            snprintf(dev->udid, sizeof(dev->udid), "%s", saved_udid);
     }
     if (device_query_info(dev) < 0)
         log_warn("[path_b] device_query_info incomplete (continuing)");
